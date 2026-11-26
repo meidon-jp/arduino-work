@@ -1,0 +1,891 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Arduino CLIの日常操作をまとめる、標準ライブラリだけのメニュー。"""
+
+import argparse
+import curses
+import codecs
+from collections import deque
+import json
+import os
+import pty
+from pathlib import Path
+import re
+import shlex
+import shutil
+import select
+import signal
+import subprocess
+import sys
+import time
+import tempfile
+import termios
+import unicodedata
+
+
+UI = None
+LOGO = r"""    _            _       _              ____ _     ___
+   / \   _ __ __| |_   _(_)_ __   ___  / ___| |   |_ _|
+  / _ \ | '__/ _` | | | | | '_ \ / _ \| |   | |    | |
+ / ___ \| | | (_| | |_| | | | | | (_) | |___| |___ | |
+/_/   \_\_|  \__,_|\__,_|_|_| |_|\___/ \____|_____|___|""".splitlines()
+
+
+def clipped(text, width):
+    """端末の表示幅で切り詰める（日本語の全角文字を含む）。"""
+    result, used = "", 0
+    for char in str(text):
+        if unicodedata.category(char).startswith("C"):
+            char = " "
+        size = 0 if unicodedata.combining(char) else (2 if unicodedata.east_asian_width(char) in "WF" else 1)
+        if used + size > width:
+            break
+        result += char
+        used += size
+    return result
+
+
+class TerminalUI:
+    """cursesの別画面で描画し、外部コマンドへ渡す前に端末を復元する。"""
+
+    def __init__(self, app):
+        self.app = app
+        self.body_offset = 0
+        self.selected = 0
+        self.handled_result = False
+        self.notice = ("編集 → 書き込み → モニタで動作確認。" if app.state["current"]
+                       else "まずスケッチとボードを選択してください。")
+
+    def start(self, screen):
+        # Esc単独か矢印キーの先頭かを判別する待ち時間。標準の約1秒を短縮。
+        curses.set_escdelay(int(os.environ.get("ESCDELAY", "40")))
+        screen.keypad(True)
+        screen.timeout(-1)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        self.colors = [curses.A_NORMAL, curses.A_BOLD, curses.A_REVERSE, curses.A_DIM]
+        if curses.has_colors() and "NO_COLOR" not in os.environ:
+            curses.start_color()
+            curses.use_default_colors()
+            accent = 208 if curses.COLORS >= 256 else curses.COLOR_YELLOW
+            for number, foreground, background in [(1, accent, -1),
+                                                    (2, curses.COLOR_BLACK, accent),
+                                                    (3, curses.COLOR_GREEN, -1)]:
+                curses.init_pair(number, foreground, background)
+            self.colors = [curses.A_NORMAL, curses.color_pair(1) | curses.A_BOLD,
+                           curses.color_pair(2) | curses.A_BOLD, curses.color_pair(3)]
+
+    @staticmethod
+    def sprite(phase, tick, result=None):
+        """オリジナルの小さな整備ロボット。値は進捗率ではなくアニメーションのコマ。"""
+        eyes = "^ ^" if result == 0 else ("? ?" if result is not None else "o o")
+        if result is not None:
+            return ["      ▄▄▄▄▄                         ▄▄▄▄▄▄▄▄▄",
+                    f"     █ {eyes} █      {'+ OK! +' if result == 0 else ' CHECK '}          █ {'^  ^' if result == 0 else '−  −'} █",
+                    "     █▄▄▄▄▄█                       █       █",
+                    "    ▄██ ▀ ██▄    ═══════════       █▄▄▄▄▄▄▄█",
+                    "      █▄▄▄█                        ┴ ┴ ┴ ┴ ┴",
+                    "      ▀   ▀       BYTE / MEDIC         MCU"]
+        if phase == "upload":
+            fill = "▓" * (6 - tick % 6) + "░" * (tick % 6)
+            needle = "━━▶" if tick % 2 else "──▷"
+            return ["      ▄▄▄▄▄                         ▄▄▄▄▄▄▄▄▄",
+                    "     █ o o █                       █ −  −  █",
+                    f"     █▄▄▄▄▄█    ┣━┫{fill}┣━━━━{needle}█       █",
+                    "    ▄██ ▀ ██━━━━┻━━━━━━━━┻         █▄▄▄▄▄▄▄█",
+                    "      █▄▄▄█                        ┴ ┴ ┴ ┴ ┴",
+                    "      ▀   ▀       DATA INJECTION       MCU"]
+        gear = ["┼", "╳", "┼", "╳"][tick % 4]
+        return ["      ▄▄▄▄▄                       ┌─────────┐",
+                "     █ o o █                      │ ▪ ▪ ▪ ▪ │",
+                f"     █▄▄▄▄▄█       {gear}  ▄▄  {gear}       │ ▪ ▪ ▪ ▪ │",
+                "    ▄██ ▀ ██━━━━     ▀▀           └─────────┘",
+                "      █▄▄▄█     ━━━━━━━━━━━━━       ┴ ┴ ┴ ┴ ┴",
+                "      ▀   ▀       ASSEMBLING           MCU"]
+
+    def job_frame(self, screen, phase, started, logs, result=None, demo=False, scroll=0, finished=None):
+        screen.erase()
+        rows, cols = screen.getmaxyx()
+        title = "DATA INJECTION" if phase == "upload" else "FIRMWARE LAB"
+        self.put(screen, 1, 2, f"▣  {title}" + ("  /  DEMO・実機操作なし" if demo else ""), 1)
+        self.put(screen, 2, 2, "━" * max(0, cols - 5), 1)
+        elapsed = (finished if finished is not None else time.monotonic()) - started
+        status = ("書き込み中・ケーブルを抜かずにお待ちください" if phase == "upload" else "コードからファームウェアを組み立てています")
+        if result is not None:
+            status = ("書き込み完了。マイコンが目を覚ましました！" if phase == "upload" else "ビルド完了。準備できました！") if result == 0 else "処理に失敗しました。下のログを確認してください。"
+        if rows >= 23 and cols >= 58:
+            x = max(2, (cols - 52) // 2)
+            for row, line in enumerate(self.sprite(phase, int(elapsed * 5), result), 4):
+                self.put(screen, row, x, line, 1)
+            y = 11
+        else:
+            y = 4
+        self.put(screen, y, 2, status, 3 if result == 0 else 1)
+        self.put(screen, y + 1, 2, f"{elapsed:.1f}s  /  " + ("DEMO" if demo else Path(self.app.state['current']).name))
+        self.put(screen, y + 3, 2, "DEVICE LOG  ─  ↑↓ / PgUp・PgDnで履歴を見る", 1)
+        available = max(0, rows - y - 7)
+        end = max(0, len(logs) - scroll)
+        for row, line in enumerate(list(logs)[max(0, end - available):end], y + 4):
+            self.put(screen, row, 2, line)
+        self.put(screen, rows - 2, 2,
+                 "Enter / q  戻る    ↑↓  ログ移動" if result is not None else "q / Esc  中止    ↑↓  ログ移動")
+        screen.refresh()
+
+    def job(self, command, phase, hold=True, demo=False):
+        process = None
+        logs = deque(maxlen=2000)
+        def run(screen):
+            nonlocal process
+            self.start(screen)
+            screen.timeout(80)
+            started, scroll = time.monotonic(), 0
+            self.job_frame(screen, phase, started, logs, demo=demo)
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            pending, eof = "", False
+            while not eof or process.poll() is None:
+                # ログ出力がない間もアニメーション・キー入力を処理する。
+                if not eof and select.select([process.stdout], [], [], 0)[0]:
+                    chunk = os.read(process.stdout.fileno(), 16384)
+                    eof = not chunk
+                    pending += decoder.decode(chunk, final=eof).replace("\r", "\n")
+                    lines = pending.split("\n")
+                    logs.extend(lines[:-1])
+                    pending = lines[-1]
+                    if len(pending) > 4096:
+                        logs.append(pending[:4096])
+                        pending = pending[4096:]
+                self.job_frame(screen, phase, started, [*logs, pending] if pending else logs, demo=demo, scroll=scroll)
+                try:
+                    key = screen.get_wch()
+                    if key in ("q", "\x1b", "\x04"):
+                        raise Cancelled()
+                    if key in (curses.KEY_UP, curses.KEY_PPAGE):
+                        scroll = min(max(0, len(logs) - 1), scroll + (5 if key == curses.KEY_PPAGE else 1))
+                    elif key in (curses.KEY_DOWN, curses.KEY_NPAGE):
+                        scroll = max(0, scroll - (5 if key == curses.KEY_NPAGE else 1))
+                except curses.error:
+                    pass
+            if pending:
+                logs.append(pending)
+            result = process.wait()
+            finished = time.monotonic()
+            if hold or result:
+                self.handled_result = True
+                while True:
+                    self.job_frame(screen, phase, started, logs, result, demo, scroll, finished)
+                    try:
+                        key = screen.get_wch()
+                        if key in ("\n", "\r", curses.KEY_ENTER, "q", "\x1b"):
+                            break
+                        if key in (curses.KEY_UP, curses.KEY_PPAGE):
+                            scroll = min(max(0, len(logs) - 1), scroll + 5)
+                        elif key in (curses.KEY_DOWN, curses.KEY_NPAGE):
+                            scroll = max(0, scroll - 5)
+                    except curses.error:
+                        pass
+            if result:
+                raise RuntimeError(f"{phase} が失敗しました（終了コード {result}）。\n" + "\n".join(list(logs)[-12:]))
+        try:
+            return curses.wrapper(run)
+        finally:
+            if process is not None:
+                # コンパイラやアップローダーの子プロセスも含めて片付ける。
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                if process.poll() is None:
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if process.poll() is None:
+                    process.wait()
+                if process.stdout:
+                    process.stdout.close()
+
+    def demo(self):
+        for phase in ("compile", "upload"):
+            code = "import time\nfor i in range(16):\n print('DEMO / ' + " + repr(phase) + " + ' / packet %02d' % i, flush=True)\n time.sleep(0.16)"
+            self.job([sys.executable, "-u", "-c", code], phase, hold=phase == "upload", demo=True)
+
+    def serial(self, command):
+        """CLIのモニタを仮想端末で動かし、受信と入力を同じ画面に表示する。"""
+        master, slave = pty.openpty()
+        attributes = termios.tcgetattr(slave)
+        attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
+        process = None
+        lines = deque(maxlen=2000)
+        pending, typed = "", ""
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        last_received = 0.0
+        def run(screen):
+            nonlocal pending, typed, last_received, process
+            self.start(screen)
+            screen.timeout(50)
+            process = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
+                                       start_new_session=True, close_fds=True)
+            os.close(slave)
+            while True:
+                try:
+                    if select.select([master], [], [], 0)[0]:
+                        try:
+                            data = os.read(master, 8192)
+                        except OSError:
+                            data = b""
+                        if data:
+                            last_received = time.monotonic()
+                            pending += decoder.decode(data).replace("\r", "")
+                            chunks = pending.split("\n")
+                            lines.extend(chunks[:-1])
+                            pending = chunks[-1][-4096:]
+                        elif process.poll() is not None:
+                            break
+                except InterruptedError:
+                    continue
+                rows, cols = screen.getmaxyx()
+                screen.erase()
+                self.put(screen, 1, 2, "▣  SERIAL / LIVE", 1)
+                active = time.monotonic() - last_received < 0.8
+                face = "●   ●" if active else "−   −"
+                self.put(screen, 3, 2, "  ╭─────────╮", 1)
+                self.put(screen, 4, 2, f"  │  {face}  │   " + ("受信！" if active else "受信待ち…"), 1)
+                self.put(screen, 5, 2, "  ╰─┬─┬─┬─┬─╯", 1)
+                self.put(screen, 7, 2, "受信ログ", 1)
+                available = max(0, rows - 12)
+                output = [*lines, pending]
+                for row, line in enumerate(output[-available:] if available else [], 8):
+                    self.put(screen, row, 2, line)
+                self.put(screen, rows - 3, 2, "> " + typed[-max(1, cols - 8):], 2)
+                self.put(screen, rows - 2, 2, "文字を入力 → Enter 送信    Ctrl+C / Esc 終了")
+                screen.refresh()
+                try:
+                    key = screen.get_wch()
+                except curses.error:
+                    continue
+                if key in ("\x1b", "\x04"):
+                    break
+                if key in ("\n", "\r", curses.KEY_ENTER):
+                    os.write(master, (typed + "\n").encode())
+                    typed = ""
+                elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    typed = typed[:-1]
+                elif isinstance(key, str) and key.isprintable():
+                    typed += key
+            if process.poll() not in (None, 0):
+                raise RuntimeError("シリアルモニタが終了しました: " + " ".join(list(lines)[-3:]))
+        try:
+            curses.wrapper(run)
+        finally:
+            if process is None:
+                os.close(slave)
+            else:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait()
+                process.wait()
+            os.close(master)
+
+    def loading(self, screen, title, started):
+        rows, _ = self.frame(screen, "読み込み中")
+        elapsed = time.monotonic() - started
+        spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(elapsed * 10) % 10]
+        self.put(screen, 11 + self.body_offset, 2, f"{spinner}  {title}", 1)
+        self.put(screen, 13 + self.body_offset, 2, f"経過 {elapsed:.1f} 秒  ·  完了すると自動で次の画面へ進みます。")
+        self.put(screen, rows - 2, 2, "Esc / q  キャンセル")
+        screen.refresh()
+
+    def capture(self, command, timeout=None, env=None):
+        labels = {("board", "list"): "接続ポートを確認しています",
+                  ("board", "listall"): "ボード一覧を読み込んでいます",
+                  ("board", "details"): "ボードの追加設定を読み込んでいます"}
+        title = ("Neovimの未保存ファイルを確認・保存しています" if timeout is not None
+                 else labels.get(tuple(command[1:3]), "Arduino CLIから情報を取得しています"))
+        process = None
+        def run(screen):
+            nonlocal process
+            self.start(screen)
+            screen.timeout(0)
+            started = time.monotonic()
+            self.loading(screen, title, started)
+            process = subprocess.Popen(command, text=True, stdin=subprocess.DEVNULL, env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            while True:
+                try:
+                    out, err = process.communicate(timeout=0.08)
+                    if process.returncode:
+                        raise RuntimeError((err or out or f"終了コード {process.returncode}").strip())
+                    return json.loads(out)
+                except subprocess.TimeoutExpired:
+                    if timeout is not None and time.monotonic() - started >= timeout:
+                        raise RuntimeError("Neovimが応答しません。入力待ちなどを解消して再実行してください。")
+                    self.loading(screen, title, started)
+                    try:
+                        if screen.get_wch() in ("q", "\x1b", "\x04"):
+                            raise Cancelled()
+                    except curses.error:
+                        pass
+        try:
+            return curses.wrapper(run)
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.communicate(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+
+    def scan(self, operation):
+        def run(screen):
+            self.start(screen)
+            self.frame(screen, "読み込み中")
+            self.put(screen, 11 + self.body_offset, 2, "スケッチのフォルダを検索しています…", 1)
+            screen.refresh()
+            return operation()
+        return curses.wrapper(run)
+
+    def put(self, screen, y, x, text, style=0, width=None):
+        rows, cols = screen.getmaxyx()
+        if not (0 <= y < rows and 0 <= x < cols - 1):
+            return
+        limit = cols - x - 1 if width is None else min(width, cols - x - 1)
+        try:
+            screen.addstr(y, x, clipped(text, limit), self.colors[style])
+        except curses.error:
+            pass
+
+    def frame(self, screen, title):
+        screen.erase()
+        rows, cols = screen.getmaxyx()
+        show_logo = rows >= 28 and cols >= max(map(len, LOGO)) + 4
+        self.body_offset = 3 if show_logo else -1
+        if show_logo:
+            for row, line in enumerate(LOGO, 1):
+                self.put(screen, row, 2, line, 1)
+        else:
+            self.put(screen, 1, 2, "Arduino CLI", 1)
+        offset = self.body_offset
+        current = self.app.state["current"]
+        settings = self.app.settings
+        self.put(screen, 4 + offset, 2, "SKETCH  " + (Path(current).name if current else "未選択"), 1)
+        self.put(screen, 5 + offset, 2, "BOARD   " + settings.get("fqbn", "未選択"))
+        self.put(screen, 6 + offset, 2, "PORT    " + settings.get("port", {}).get("address", "未選択")
+                 + f"   /   {settings.get('baud', 115200)} baud")
+        self.put(screen, 8 + offset, 2, title, 1)
+        self.put(screen, rows - 3, 2, "─" * max(0, cols - 5), 1)
+        return rows, cols
+
+    def choose(self, title, items, dashboard=False):
+        def run(screen):
+            self.start(screen)
+            selected = min(self.selected, len(items) - 1) if dashboard else 0
+            digits = ""
+            while True:
+                rows, cols = self.frame(screen, title)
+                if rows < 19 or cols < 48:
+                    screen.erase()
+                    self.put(screen, 0, 0, "画面を広げてください（48列 × 19行以上）。")
+                    self.put(screen, 2, 0, "q / Esc: 戻る")
+                else:
+                    side = cols >= 96
+                    capacity = max(1, rows - (14 if side else 17) - self.body_offset)
+                    offset = max(0, min(selected - capacity // 2, len(items) - capacity))
+                    left_width = min(43, cols // 2 - 3) if side else cols - 5
+                    for row, index in enumerate(range(offset, min(len(items), offset + capacity)), 10 + self.body_offset):
+                        label = f"{'›' if index == selected else ' '} {index + 1:2}  {items[index][0]}"
+                        self.put(screen, row, 2, label + " " * left_width,
+                                 2 if index == selected else 0, left_width)
+                    description = items[selected][2] if len(items[selected]) > 2 else "選択してEnterで確定します。"
+                    x, y = (cols // 2 + 2, 10 + self.body_offset) if side else (2, rows - 7)
+                    self.put(screen, y, x, "GUIDE", 1)
+                    # 文字単位の折り返し。全角幅を考慮し、狭いペインでも欠けない。
+                    remaining = description
+                    for line in range(1, min(6, rows - y - 4)):
+                        part = clipped(remaining, cols - x - 3)
+                        self.put(screen, y + line, x, part)
+                        remaining = remaining[len(part):]
+                        if not remaining:
+                            break
+                    self.put(screen, rows - 4, 2,
+                             f"{selected + 1} / {len(items)}   " + (f"番号: {digits}" if digits else self.notice), 3)
+                    footer = ("↑↓ / j k  移動    Enter  決定    数字→Enter  選択    q / Esc  戻る" if side
+                              else "↑↓ 選択  Enter 決定  数字指定  q/Esc 戻る")
+                    self.put(screen, rows - 2, 2, footer)
+                screen.refresh()
+                key = screen.get_wch()
+                if key in ("q", "\x1b", "\x04"):
+                    if dashboard:
+                        return None
+                    raise Cancelled()
+                if rows < 19 or cols < 48:
+                    continue
+                if key in (curses.KEY_DOWN, "j", "\t"):
+                    selected = (selected + 1) % len(items)
+                    digits = ""
+                elif key in (curses.KEY_UP, "k", curses.KEY_BTAB):
+                    selected = (selected - 1) % len(items)
+                    digits = ""
+                elif key == curses.KEY_NPAGE:
+                    selected = min(len(items) - 1, selected + capacity)
+                elif key == curses.KEY_PPAGE:
+                    selected = max(0, selected - capacity)
+                elif isinstance(key, str) and key.isascii() and key.isdigit():
+                    digits = (digits + key)[-len(str(len(items))):]
+                elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    digits = digits[:-1]
+                elif key in ("\n", "\r", curses.KEY_ENTER):
+                    if digits:
+                        if not 1 <= int(digits) <= len(items):
+                            digits = ""
+                            continue
+                        selected = int(digits) - 1
+                    if dashboard:
+                        self.selected = selected
+                    return items[selected][1]
+        return curses.wrapper(run)
+
+    def read(self, label, default="", allow_empty=False):
+        def run(screen):
+            self.start(screen)
+            value = default
+            while True:
+                rows, cols = self.frame(screen, "入力")
+                self.put(screen, 10 + self.body_offset, 2, label, 1)
+                # 長いパスは末尾を表示する。左矢印などは編集せず、末尾で入力・削除する。
+                tail = value
+                while tail and len(clipped(tail, cols - 8)) < len(tail):
+                    tail = tail[1:]
+                self.put(screen, 12 + self.body_offset, 2, "> " + tail + "▏", 2)
+                self.put(screen, rows - 2, 2, "Enter  確定    Backspace  削除    Ctrl+U  全消去    Esc  戻る")
+                screen.refresh()
+                key = screen.get_wch()
+                if key in ("\x1b", "\x04"):
+                    raise Cancelled()
+                if key in ("\n", "\r", curses.KEY_ENTER):
+                    if value.strip() or allow_empty:
+                        return value.strip()
+                    raise Cancelled()
+                if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    value = value[:-1]
+                elif key == "\x15":
+                    value = ""
+                elif isinstance(key, str) and key.isprintable():
+                    value += key
+        return curses.wrapper(run)
+
+
+def ask(label):
+    return UI.read(label, allow_empty=True) if UI else input(label)
+
+
+class Cancelled(Exception):
+    pass
+
+
+def choose(title, items):
+    if not items:
+        raise ValueError("候補がありません。接続やコアのインストールを確認してください。")
+    if UI:
+        return UI.choose(title, items)
+    print(f"\n{title}")
+    for i, (label, *_) in enumerate(items, 1):
+        print(f"  {i:3}. {label}")
+    while True:
+        answer = input("番号（Enterで戻る）> ").strip()
+        if not answer:
+            raise Cancelled()
+        if answer.isdigit() and 1 <= int(answer) <= len(items):
+            return items[int(answer) - 1][1]
+        print("表示された番号を入力してください。")
+
+
+def prompt(label, default=""):
+    if UI:
+        return UI.read(label, default)
+    value = input(f"{label}" + (f" [{default}]" if default else "") + "> ").strip()
+    if value or default:
+        return value or default
+    raise Cancelled()
+
+
+def execute(command, capture=False):
+    if capture and UI:
+        return UI.capture(command)
+    if not capture:
+        print("\n$ " + shlex.join(map(str, command)), flush=True)
+    process = subprocess.Popen(command, text=True,
+                               stdout=subprocess.PIPE if capture else None,
+                               stderr=subprocess.PIPE if capture else None)
+    try:
+        out, err = process.communicate()
+    except KeyboardInterrupt:
+        # 子も同じ端末からSIGINTを受ける。終了を待ちポートを解放する。
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise Cancelled() from None
+    if process.returncode:
+        raise RuntimeError((err or out or f"コマンドが終了コード {process.returncode} で失敗しました。").strip())
+    return json.loads(out) if capture else None
+
+
+class ArduinoWork:
+    def __init__(self, root, cli=None):
+        self.root = Path(root).expanduser().resolve()
+        self.state_file = self.root / ".arduino-work" / "state.json"
+        local = self.root / "arduino-cli"
+        self.cli = cli or os.environ.get("ARDUINO_CLI") or (
+            str(local) if local.is_file() else shutil.which("arduino-cli"))
+        if not self.cli:
+            raise ValueError("arduino-cliが見つかりません。macOS: brew install arduino-cli")
+        self.state = {"current": "", "settings": {"baud": 115200}, "sketches": {}}
+        if self.state_file.exists():
+            self.state = json.loads(self.state_file.read_text())
+            if (not isinstance(self.state, dict)
+                    or not isinstance(self.state.get("current"), str)
+                    or not isinstance(self.state.get("sketches"), dict)
+                    or any(not isinstance(v, dict) for v in self.state["sketches"].values())):
+                raise ValueError(f"設定の形式が不正です: {self.state_file}")
+            # 旧形式は最後に使用したスケッチの設定を共通設定に移行する。
+            # 過去のスケッチ設定は残し、次の保存まではディスクを変更しない。
+            if "settings" not in self.state:
+                self.state["settings"] = {"baud": 115200, **self.state["sketches"].get(self.state["current"], {})}
+            if not isinstance(self.state["settings"], dict):
+                raise ValueError(f"共通設定の形式が不正です: {self.state_file}")
+
+    def cli_run(self, *args, capture=False):
+        result = execute([self.cli, *map(str, args)], capture)
+        if UI and not capture and args[:2] in (("core", "search"), ("lib", "search")):
+            input("\n検索結果を確認したらEnterで入力画面へ > ")
+        return result
+
+    def save(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_file.with_suffix(".tmp")
+        temporary.write_text(json.dumps(self.state, ensure_ascii=False, indent=2) + "\n")
+        temporary.replace(self.state_file)
+
+    @property
+    def sketch(self):
+        path = Path(self.state["current"])
+        if not self.state["current"] or not (path / f"{path.name}.ino").is_file():
+            raise ValueError("先にスケッチを選択してください。フォルダと主.inoは同名にします。")
+        return path
+
+    @property
+    def settings(self):
+        return self.state["settings"]
+
+    def select_sketch(self, path=None):
+        if path is None:
+            query = ask("スケッチ名で絞り込み（Enterですべて）> ").strip().lower()
+            def scan():
+                found = []
+                for base, dirs, files in os.walk(self.root):
+                    dirs[:] = sorted(d for d in dirs if not d.startswith(".")
+                                     and d not in {"build", "node_modules", "vendor"})
+                    folder = Path(base)
+                    if f"{folder.name}.ino" in files and query in str(folder).lower():
+                        found.append((str(folder.relative_to(self.root)), str(folder)))
+                return found
+            found = UI.scan(scan) if UI else scan()
+            path = choose("スケッチを選択", found + [("パスを入力", None)])
+            if path is None:
+                path = prompt("スケッチのフォルダまたは.inoのパス")
+        path = Path(path).expanduser().resolve()
+        if path.suffix == ".ino":
+            path = path.parent
+        if not (path / f"{path.name}.ino").is_file():
+            raise ValueError(f"{path.name}.ino が見つかりません: {path}")
+        self.state["current"] = str(path)
+        self.save()
+
+    def new_sketch(self):
+        name = prompt("新しいスケッチ名（英字で開始、英数字と_、63文字以内）")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,62}", name):
+            raise ValueError("名前には英数字と_を使用してください。")
+        folder = self.root / "arduino" / "examples" / name
+        folder.mkdir(parents=True, exist_ok=False)
+        (folder / f"{name}.ino").write_text(
+            "void setup() {\n  Serial.begin(115200);\n}\n\n"
+            'void loop() {\n  Serial.print("uptime_ms=");\n'
+            "  Serial.println(millis());\n  delay(1000);\n}\n")
+        self.select_sketch(folder)
+
+    def select_board(self):
+        settings = self.settings
+        query = ask("ボード名で検索（例: UNO、ESP32、Enterですべて）> ").strip()
+        boards = self.cli_run("board", "listall", query, "--json", capture=True).get("boards", [])
+        fqbn = choose("導入済みコアのボード", [
+            (f"{b['name']}  ({b['fqbn']})", b["fqbn"]) for b in boards
+        ] + [("FQBNを直接入力", None)])
+        if fqbn is None:
+            fqbn = prompt("FQBN（追加オプションも指定可能）")
+        details = self.cli_run("board", "details", "--fqbn", fqbn, "--json", capture=True)
+        options = []
+        for option in details.get("config_options", []):
+            value = choose(option["option_label"], [
+                (v["value_label"] + (" [現在値]" if v.get("selected") else ""), v["value"])
+                for v in option["values"]])
+            options.append(f"{option['option']}={value}")
+        base = ":".join(fqbn.split(":")[:3])
+        settings["fqbn"] = base + (":" + ",".join(options) if options else fqbn[len(base):])
+        self.save()
+
+    def ports(self):
+        return self.cli_run("board", "list", "--json", capture=True).get("detected_ports", [])
+
+    def select_port(self):
+        items = []
+        for entry in self.ports():
+            port = entry["port"]
+            names = ", ".join(b["name"] for b in entry.get("matching_boards", [])) or "機種不明"
+            items.append((f"{port['address']} ({port['protocol']}, {names})", port))
+        port = choose("接続先（実際につないだボードを選択）", items + [("ポートを直接入力", None)])
+        if port is None:
+            port = {"address": prompt("ポート"), "protocol": prompt("プロトコル", "serial")}
+        self.settings["port"] = {k: port[k] for k in ("address", "protocol")}
+        self.save()
+
+    def port_args(self):
+        saved = self.settings.get("port")
+        available = [p["port"] for p in self.ports()]
+        if not saved or not any(all(p.get(k) == saved[k] for k in ("address", "protocol"))
+                                for p in available):
+            print("接続先を選択してください（USBの再接続後は名前が変わる場合があります）。")
+            self.select_port()
+        port = self.settings["port"]
+        return ["--port", port["address"], "--protocol", port["protocol"]]
+
+    def fqbn_args(self):
+        if not self.settings.get("fqbn"):
+            self.select_board()
+        return ["--fqbn", self.settings["fqbn"]]
+
+    def build(self, upload=False, monitor=False):
+        fqbn = self.fqbn_args()
+        port = self.port_args() if upload else []
+        self.save_editors()
+        # このビルドの成果物だけを書き込む。失敗したビルドの古いバイナリは使わない。
+        with tempfile.TemporaryDirectory(prefix="arduino-work-build-") as output:
+            compile_args = ["compile", *fqbn, "--no-color", "--warnings", "all", "--output-dir", output, str(self.sketch)]
+            if UI:
+                UI.job([self.cli, *compile_args], "compile", hold=not upload)
+            else:
+                self.cli_run(*compile_args)
+            if upload:
+                upload_args = ["upload", *fqbn, *port, "--no-color", "--input-dir", output, str(self.sketch)]
+                if UI:
+                    UI.job([self.cli, *upload_args], "upload", hold=not monitor)
+                else:
+                    self.cli_run(*upload_args)
+        if monitor:
+            self.monitor()
+
+    def save_editors(self):
+        print("Neovimの未保存ファイルを確認・保存中…", flush=True)
+        helper = Path(__file__).resolve().with_name("arduino-save.lua")
+        command = ["nvim", "--headless", "-u", "NONE", "-i", "NONE", "-n",
+                   "-l", str(helper), str(self.sketch)]
+        env = dict(os.environ, NVIM_LOG_FILE=os.devnull)
+        if UI:
+            result = UI.capture(command, timeout=10, env=env)
+        else:
+            try:
+                completed = subprocess.run(command, text=True, capture_output=True, timeout=10, env=env)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("Neovimが応答しません。入力待ちなどを解消して再実行してください。") from None
+            if completed.returncode:
+                raise RuntimeError(completed.stderr.strip() or "Neovimとの連携に失敗しました。")
+            result = json.loads(completed.stdout)
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error", "Neovimで保存できませんでした。"))
+        print(f"保存確認完了: {result['saved']}ファイル保存 / {result['editors']}ウィンドウ確認", flush=True)
+
+    def monitor(self):
+        fqbn = self.fqbn_args()
+        port = self.port_args()
+        print("Ctrl+Cでモニタを終了してメニューに戻ります。")
+        args = ["monitor", *fqbn, *port, "--config",
+                f"baudrate={self.settings.get('baud', 115200)}", "--timestamp"]
+        if UI:
+            UI.serial([self.cli, *args])
+            UI.handled_result = True
+        else:
+            self.cli_run(*args)
+
+    def baud(self):
+        value = prompt("Serial.begin(...) と同じ通信速度", str(self.settings.get("baud", 115200)))
+        if not value.isdigit() or int(value) <= 0:
+            raise ValueError("通信速度は正の整数にしてください。")
+        self.settings["baud"] = int(value)
+        self.save()
+
+    def edit(self):
+        editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nvim")
+        execute([*editor, str(self.sketch / f"{self.sketch.name}.ino")])
+
+    def install_core(self):
+        presets = [
+            ("Arduino UNO R4", ("arduino:renesas_uno", "")),
+            ("Arduino UNO R3 / 従来のNano", ("arduino:avr", "")),
+            ("ESP32", ("esp32:esp32", "https://espressif.github.io/arduino-esp32/package_esp32_index.json")),
+            ("Pico / Pico W (Arduino-Pico)", ("rp2040:rp2040", "https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json")),
+            ("ほかのコア（検索・入力）", None),
+        ]
+        selection = choose("必要なコアをインストール", presets)
+        if selection is None:
+            url = ask("メーカー指定の追加URL（不要ならEnter）> ").strip()
+            extra = ["--additional-urls", url] if url else []
+            self.cli_run("core", "update-index", *extra)
+            self.cli_run("core", "search", prompt("検索語"), *extra)
+            core = prompt("導入するコアID（例 vendor:architecture、@version指定可）")
+        else:
+            core, url = selection
+            extra = ["--additional-urls", url] if url else []
+            self.cli_run("core", "update-index", *extra)
+        self.cli_run("core", "install", core, *extra)
+
+    def install_library(self):
+        self.cli_run("lib", "update-index")
+        self.cli_run("lib", "search", prompt("ライブラリの検索語"))
+        self.cli_run("lib", "install", prompt("正確なライブラリ名（@version指定可）"))
+
+    def menu(self, plain=False):
+        global UI
+        actions = [
+            ("スケッチを選択", self.select_sketch), ("新しいスケッチ", self.new_sketch),
+            ("ボード・追加設定を選択", self.select_board), ("ポートを選択", self.select_port),
+            ("シリアル速度を設定", self.baud), ("Neovimで編集", self.edit),
+            ("ビルド", self.build), ("ビルドして書き込み", lambda: self.build(upload=True)),
+            ("書き込み → シリアルモニタ", lambda: self.build(upload=True, monitor=True)),
+            ("シリアルモニタ", self.monitor), ("コアをインストール", self.install_core),
+            ("ライブラリを検索・インストール", self.install_library),
+            ("接続ボード・導入済みコアを表示", self.info), ("終了", None),
+        ]
+        descriptions = [
+            "作業フォルダからスケッチを検索します。ボード・ポート・通信速度はそのまま引き継ぎます。外部フォルダのパスも指定できます。",
+            "1秒おきに経過時間を送信するサンプルを作ります。最初の動作確認に使えます。",
+            "書き込み先の機種を選びます。CPU、ブートローダー、USBなどの追加設定もここで選択します。",
+            "USBでつないだ実物の接続先を選びます。機器を交換したら、ここから選び直してください。",
+            "Serial.begin(...) と同じ値にします。標準は115200。既存のSerialMyNameは9600です。",
+            "Neovimでコードを編集します。保存して :wq で終了すると、この画面に戻ります。",
+            "コードをコンパイルしてエラーを確認します。ボードが接続されていなくても実行できます。",
+            "コンパイルして、選んだボードへ書き込みます。ボードは通常、書き込み後にプログラムを実行し始めます。",
+            "普段の動作確認に。ビルドと書き込みが成功したらモニタを開きます。Ctrl+Cでモニタを閉じます。",
+            "ボードから届く文字を表示します。文字を入力してEnterで送信、Ctrl+Cで終了します。",
+            "対象のボードを開発するためのコアを導入します。UNO、ESP32、Picoのほか、任意のコアにも対応します。",
+            "必要なライブラリを検索して導入します。検索結果の名前を確認してから指定してください。",
+            "接続ポート、CLIのバージョン、導入済みコアを確認します。接続トラブルの確認にも使えます。",
+            "アプリを終了します。選択した設定は保存済みです。ボードのプログラムは動き続けます。",
+        ]
+        actions = [(*action, description) for action, description in zip(actions, descriptions)]
+        if not plain and sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb":
+            UI = TerminalUI(self)
+        try:
+            while True:
+                try:
+                    if UI:
+                        action = UI.choose("WORKSPACE / 操作を選択", actions, dashboard=True)
+                    else:
+                        current = self.state["current"]
+                        settings = self.settings
+                        print(f"\nArduino Work\n  スケッチ: {current or '未選択'}\n"
+                              f"  ボード: {settings.get('fqbn', '未選択')}\n"
+                              f"  ポート: {settings.get('port', {}).get('address', '未選択')}\n"
+                              f"  速度: {settings.get('baud', 115200)}")
+                        action = choose("操作", actions)
+                    if action is None:
+                        return
+                    if UI:
+                        UI.handled_result = False
+                        print("\033[2J\033[H", end="", flush=True)
+                    action()
+                    if UI:
+                        UI.notice = "完了しました。設定は自動保存されます。"
+                        if UI.selected >= 5 and not UI.handled_result:
+                            input("\n完了しました。Enterでワークスペースへ > ")
+                except (Cancelled, KeyboardInterrupt):
+                    if UI:
+                        UI.notice = "操作を終了しました。"
+                    else:
+                        print("メニューに戻りました。")
+                except (OSError, ValueError, RuntimeError) as error:
+                    print(f"エラー: {error}", file=sys.stderr)
+                    if UI:
+                        UI.notice = "前の操作でエラーが発生しました。設定・接続を確認してください。"
+                        try:
+                            if not UI.handled_result:
+                                input("\nEnterでワークスペースへ > ")
+                        except KeyboardInterrupt:
+                            pass
+        finally:
+            UI = None
+
+    def info(self):
+        self.cli_run("version")
+        self.cli_run("board", "list")
+        self.cli_run("core", "list")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", nargs="?", default="menu",
+                        choices=["menu", "build", "upload", "run", "monitor", "edit", "info"])
+    parser.add_argument("--root", default=str(Path.home() / "prog" / "mcu"), help="スケッチ検索・設定の保存先")
+    parser.add_argument("--cli", help="arduino-cliの実行ファイル")
+    parser.add_argument("--sketch", help="スケッチのフォルダまたは.ino")
+    parser.add_argument("--plain", action="store_true", help="色や画面切り替えを使わない番号メニュー")
+    parser.add_argument("--demo", action="store_true", help="実機を操作せず組み立て・注射アニメーションを試す")
+    args = parser.parse_args()
+    try:
+        app = ArduinoWork(args.root, args.cli or ("demo" if args.demo else None))
+        if args.demo:
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                raise ValueError("デモはターミナルで実行してください。")
+            TerminalUI(app).demo()
+            return 0
+        if args.sketch:
+            app.select_sketch(args.sketch)
+        if args.action == "menu":
+            app.menu(plain=args.plain)
+        elif args.action == "upload":
+            app.build(upload=True)
+        elif args.action == "run":
+            app.build(upload=True, monitor=True)
+        else:
+            getattr(app, args.action)()
+    except (Cancelled, KeyboardInterrupt, EOFError):
+        return 130
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"エラー: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
